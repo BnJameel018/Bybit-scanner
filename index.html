@@ -126,8 +126,11 @@ details.rules ol{margin:10px 0 0; padding-left:20px; color:var(--mute); font-siz
   </header>
 
   <section class="settings" aria-label="Scan settings">
-    <div class="field"><label for="maxPrice">Max price (USDT)</label><input id="maxPrice" type="number" inputmode="decimal" min="0" step="any" value="50"></div>
+    <div class="field"><label for="maxPrice">Max price (0 = no limit)</label><input id="maxPrice" type="number" inputmode="decimal" min="0" step="any" value="0"></div>
     <div class="field"><label for="minVol">Min 24h volume (USDT)</label><input id="minVol" type="number" inputmode="decimal" min="0" step="any" value="0"></div>
+    <div class="field"><label for="maxChop">Max choppiness (0 = off)</label><input id="maxChop" type="number" inputmode="decimal" min="0" max="100" step="any" value="61.8"></div>
+    <p class="hint">14-day Choppiness Index at the rejection. Above 61.8 is choppy.</p>
+    <label class="check"><input id="dailyFilter" type="checkbox" checked> Skip pairs that touched a Daily resistance after the rejection</label>
     <label class="check"><input id="sound" type="checkbox" checked> Beep and vibrate on a new trigger</label>
   </section>
 
@@ -149,7 +152,9 @@ details.rules ol{margin:10px 0 0; padding-left:20px; color:var(--mute); font-siz
   <details class="rules">
     <summary>How the rules are read</summary>
     <ol>
-      <li>Only USDT pairs priced under the max price, using each pair's price at scan time.</li>
+      <li>Only USDT pairs priced under the max price at scan time. Leave it at 0 for no price limit.</li>
+      <li>Choppiness: the Choppiness Index over the 14 Daily candles ending with the rejection candle. Pairs above the max are skipped. Set it to 0 to turn the filter off.</li>
+      <li>Daily resistance: a bullish Daily candle followed by a bearish one, at the bullish close, above the support and not touched since it formed. After the first touch of the support, a pair is skipped if price has reached the lowest such level by the time of the scan, checked on H4 highs from the next H4 candle on. This applies even if the H4 resistance already broke, and triggered setups are rechecked on every scan.</li>
       <li>Support: a bearish Daily candle followed by a bullish one. Support is the bearish candle's close. Touches count from the candle after the bullish one.</li>
       <li>Rejection: the previous closed Daily candle is the first to reach the support (low at or under it) and closes above it.</li>
       <li>Resistance: an H4 bullish candle followed by a bearish one, at the bullish close, above the support, completed before the touch and never closed above before it. The lowest one is used.</li>
@@ -246,6 +251,47 @@ function evaluate(rej, h4) {
 
 function analyze(daily, h4) {
   return findRejections(daily).map(r => evaluate(r, h4)).filter(Boolean);
+}
+
+// Choppiness Index over the last n Daily candles: near 100 is pure chop, under about 38 is a clean trend.
+function choppiness(daily, n = 14) {
+  if (daily.length < n + 1) return null;
+  const w = daily.slice(-n);
+  let pc = daily[daily.length - n - 1].c, sum = 0, hi = -Infinity, lo = Infinity;
+  for (const k of w) {
+    sum += Math.max(k.h - k.l, Math.abs(k.h - pc), Math.abs(k.l - pc));
+    if (k.h > hi) hi = k.h;
+    if (k.l < lo) lo = k.l;
+    pc = k.c;
+  }
+  const range = hi - lo;
+  if (!(range > 0)) return 100;
+  return Math.round(1000 * Math.log10(sum / range) / Math.log10(n)) / 10;
+}
+
+// Lowest valid Daily resistance above the support at the moment of the first touch.
+// A Daily resistance is a bullish candle followed by a bearish one, at the bullish close.
+// Valid means no later candle (Daily, then H4 inside the rejection day) reached it before the touch.
+// `daily` ends with the rejection candle.
+function dailyResistance(daily, h4, S, dayT, touchT) {
+  const di = daily.length - 1;
+  let best = null;
+  for (let j = 0; j + 1 < di; j++) {
+    if (!(bull(daily[j]) && bear(daily[j + 1]))) continue;
+    const r = daily[j].c;
+    if (!(r > S)) continue;
+    let ok = true;
+    for (let m = j + 2; m < di; m++) { if (daily[m].h >= r) { ok = false; break; } }
+    if (ok) for (const k of h4) { if (k.t >= dayT && k.t < touchT && k.h >= r) { ok = false; break; } }
+    if (ok && (best === null || r < best)) best = r;
+  }
+  return best;
+}
+
+// Has price reached that Daily resistance at any point since the first touch, up to the latest closed H4 candle?
+function dailyTouched(h4, s) {
+  if (s.dRes === null || s.dRes === undefined) return false;
+  return h4.some(k => k.t > s.touchT && k.h >= s.dRes);
 }
 // ==== LOGIC END
 
@@ -345,6 +391,8 @@ function card(s) {
     rows.push(`<div><dt>Needs H4 close above</dt><dd>${gap.toFixed(2)}%<small>from last price</small></dd></div>`);
   }
   if (s.route === 'exception') rows.push(`<div><dt>Sweep</dt><dd>${fp(s.sweepLow)}<small>${tfmt(s.sweepT)}</small></dd></div>`);
+  if (s.chop !== null && s.chop !== undefined) rows.push(`<div><dt>Choppiness</dt><dd>${s.chop.toFixed(1)}</dd></div>`);
+  if (s.dRes !== null && s.dRes !== undefined) rows.push(`<div><dt>Daily resistance</dt><dd>${fp(s.dRes)}<small>untouched</small></dd></div>`);
 
   return `<article class="card">
     <div class="head">
@@ -414,7 +462,7 @@ async function scan() {
   running = true; stopped = false; showErr('');
   ctrl = new AbortController();
   seenAtStart = new Set(seen);
-  scanned = { done: 0, total: 0, failed: 0, t0: Date.now(), rej: 0 };
+  scanned = { done: 0, total: 0, failed: 0, t0: Date.now(), rej: 0, choppy: 0, dres: 0 };
   let now = Date.now();
   $('go').textContent = 'Stop'; $('go').className = 'stop';
   arm();
@@ -424,13 +472,17 @@ async function scan() {
       .then(w => { wake = w; if (!running) { try { w.release(); } catch (e) {} } }).catch(() => {});
   } catch (e) {}
 
-  results = recentTrig.filter(s => now - s.breakT < KEEP_TRIGGERED);
+  results = [];
   setStatus('Loading pairs', ''); render();
 
   try {
-    const maxPrice = parseFloat($('maxPrice').value) || 50;
+    const mp = parseFloat($('maxPrice').value);
+    const maxPrice = mp > 0 ? mp : Infinity;
     const minVol = parseFloat($('minVol').value) || 0;
-    store.set('rs_cfg', { maxPrice, minVol, sound: $('sound').checked });
+    const maxChop = parseFloat($('maxChop').value) || 0;
+    const useDres = $('dailyFilter').checked;
+    const dropKeys = new Set();
+    store.set('rs_cfg2', { maxPrice: $('maxPrice').value, minVol, maxChop, dres: useDres, sound: $('sound').checked });
 
     const tk = await api('/v5/market/tickers?category=spot', ctrl.signal);
     now = +tk.time || Date.now();
@@ -444,7 +496,10 @@ async function scan() {
       .map(x => ({ symbol: x.symbol, price: parseFloat(x.lastPrice), vol: parseFloat(x.turnover24h) || 0 }))
       .filter(x => x.price > 0 && x.price < maxPrice && x.vol >= minVol);
     // Saved setups from earlier days that are still listed. Today's rejections are handled by the main pass.
-    const saved = watch.filter(w => w.dayT !== dayT && prices[w.symbol] > 0 && !dismissed.has(wkey(w)));
+    const pool = new Map();
+    watch.concat(recentTrig.filter(w => now - w.breakT < KEEP_TRIGGERED)).forEach(w => pool.set(wkey(w), w));
+    const saved = Array.from(pool.values()).filter(w => w.dayT !== dayT && prices[w.symbol] > 0 && !dismissed.has(wkey(w))
+      && !(maxChop > 0 && w.chop != null && w.chop > maxChop));
     scanned.total = list.length + saved.length;
     setStatus('Scanning', `0 / ${scanned.total}`);
 
@@ -466,16 +521,20 @@ async function scan() {
         try {
           const dj = await api(`/v5/market/kline?category=spot&symbol=${p.symbol}&interval=D&limit=${LB.daily}`, ctrl.signal);
           const daily = parseK(dj.result.list, DAY, now);
-          const rejs = findRejections(daily);
+          let rejs = findRejections(daily);
           scanned.rej += rejs.length;
+          const chop = rejs.length ? choppiness(daily) : null;
+          if (rejs.length && maxChop > 0 && chop !== null && chop > maxChop) { scanned.choppy++; rejs = []; }
           if (rejs.length && !stopped) {
             const hj = await api(`/v5/market/kline?category=spot&symbol=${p.symbol}&interval=240&limit=${LB.h4}`, ctrl.signal);
             const h4 = parseK(hj.result.list, H4MS, now);
             rejs.forEach(r => {
               const s = evaluate(r, h4);
               if (!s) return;
-              s.symbol = p.symbol; s.price = p.price; s.vol = p.vol;
+              s.symbol = p.symbol; s.price = p.price; s.vol = p.vol; s.chop = chop;
               if (dismissed.has(wkey(s))) return;
+              s.dRes = dailyResistance(daily, h4, s.S, s.dayT, s.touchT);
+              if (useDres && dailyTouched(h4, s)) { scanned.dres++; return; }
               addResult(s);
             });
             scheduleRender();
@@ -499,10 +558,15 @@ async function scan() {
           const hj = await api(`/v5/market/kline?category=spot&symbol=${w.symbol}&interval=240&limit=${LB.h4}`, ctrl.signal);
           const h4 = parseK(hj.result.list, H4MS, now);
           const s = evaluate({ S: w.S, supportT: w.supportT, dayT: w.dayT }, h4);
-          if (s) { s.symbol = w.symbol; s.price = prices[w.symbol]; s.vol = w.vol; addResult(s); scheduleRender(); }
+          if (s) {
+            s.symbol = w.symbol; s.price = prices[w.symbol]; s.vol = w.vol; s.chop = w.chop; s.dRes = w.dRes;
+            if (useDres && dailyTouched(h4, s)) { scanned.dres++; dropKeys.add(wkey(s)); }
+            else { addResult(s); scheduleRender(); }
+          }
         } catch (e) {
           if (stopped || ctrl.signal.aborted) return;
           scanned.failed++;
+          if (w.status === 'triggered') addResult(w);   // keep the last known result if the recheck failed
         }
         scanned.done++;
         setStatus('Rechecking saved', `${scanned.done} / ${scanned.total}`);
@@ -517,13 +581,21 @@ async function scan() {
       if (s.status === 'watching') kept.set(wkey(s), s);
       else if (s.status === 'triggered') kept.delete(wkey(s));
     });
+    dropKeys.forEach(k => kept.delete(k));
     watch = Array.from(kept.values());
-    recentTrig = results.filter(s => s.status === 'triggered' && now - s.breakT < KEEP_TRIGGERED);
+    const trigNow = results.filter(s => s.status === 'triggered' && now - s.breakT < KEEP_TRIGGERED);
+    if (stopped) {
+      const m = new Map();
+      recentTrig.concat(trigNow).forEach(s => m.set(wkey(s), s));
+      recentTrig = Array.from(m.values()).filter(s => now - s.breakT < KEEP_TRIGGERED);
+    } else recentTrig = trigNow;
     store.set('rs_watch', watch); store.set('rs_trig', recentTrig); store.set('rs_seen', Array.from(seen));
 
     const secs = Math.round((Date.now() - scanned.t0) / 1000);
     const f = scanned.failed ? ` · ${scanned.failed} failed` : '';
-    const body = `${scanned.done} / ${scanned.total} pairs · ${scanned.rej} rejections${f}`;
+    const ch = scanned.choppy ? ` · ${scanned.choppy} choppy skipped` : '';
+    const dr = scanned.dres ? ` · ${scanned.dres} skipped (daily resistance)` : '';
+    const body = `${scanned.done} / ${scanned.total} pairs · ${scanned.rej} rejections${ch}${dr}${f}`;
     if (stopped) setStatus('Stopped', body);
     else setStatus('Done', `${body} · ${secs}s`);
   } catch (e) {
@@ -555,8 +627,8 @@ $('list').addEventListener('click', e => {
   render();
 });
 
-const cfg = store.get('rs_cfg', null);
-if (cfg) { $('maxPrice').value = cfg.maxPrice; $('minVol').value = cfg.minVol; $('sound').checked = cfg.sound !== false; }
+const cfg = store.get('rs_cfg2', null);
+if (cfg) { $('maxPrice').value = cfg.maxPrice; $('minVol').value = cfg.minVol; $('maxChop').value = cfg.maxChop; $('dailyFilter').checked = cfg.dres !== false; $('sound').checked = cfg.sound !== false; }
 results = recentTrig.filter(s => Date.now() - s.breakT < KEEP_TRIGGERED);
 render();
 </script>
