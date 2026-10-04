@@ -84,11 +84,15 @@ h1{margin:0; font-size:26px; line-height:1.1; font-weight:700; letter-spacing:-.
 .sym span{color:var(--mute); font-weight:400}
 .px{margin-left:auto; font:500 14px var(--mono); color:var(--mute)}
 .new{font:700 10.5px var(--sans); letter-spacing:.08em; padding:2px 7px; border-radius:99px; background:var(--accent); color:var(--on-accent)}
-.chips{display:flex; gap:6px; flex-wrap:wrap}
+.chips{display:flex; gap:6px; flex-wrap:wrap; align-items:center}
 .chip{font:600 12px var(--sans); padding:3px 9px; border-radius:99px}
 .chip.go{background:var(--go-bg); color:var(--go)}
 .chip.watch{background:var(--watch-bg); color:var(--watch)}
 .chip.idle{background:var(--idle-bg); color:var(--idle)}
+.rm{
+  margin-left:auto; appearance:none; border:1px solid var(--line); background:transparent; color:var(--mute);
+  font:600 12px var(--sans); border-radius:99px; padding:3px 11px; cursor:pointer;
+}
 .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; margin:0}
 .grid>div{min-width:0}
 .grid dt{font-size:11px; letter-spacing:.07em; text-transform:uppercase; color:var(--mute); font-weight:600}
@@ -151,6 +155,7 @@ details.rules ol{margin:10px 0 0; padding-left:20px; color:var(--mute); font-siz
       <li>Resistance: an H4 bullish candle followed by a bearish one, at the bullish close, above the support, completed before the touch and never closed above before it. The lowest one is used.</li>
       <li>Break: an H4 close above the resistance, checked from the H4 candle that first touched the support. A break inside that Daily candle is flagged as an alert at the daily reset.</li>
       <li>Exception: if a later H4 candle sweeps the first touch's low and closes above the support, the highest unbroken resistance formed after the first touch replaces the original, and an H4 close above it triggers.</li>
+      <li>Watch list: every setup still waiting for a break is saved on this phone and rechecked on each scan until it triggers or you tap Remove. Triggered setups stay listed for 3 days.</li>
       <li>Supports are searched in the last 365 Daily candles and resistances in the last 400 H4 candles.</li>
     </ol>
   </details>
@@ -247,7 +252,7 @@ function analyze(daily, h4) {
 // ---------- App ----------
 const API = 'https://api.bybit.com';
 const LB = { daily: 365, h4: 400 };
-const CONC = 6;
+const CONC = 6, TIMEOUT = 15000, KEEP_TRIGGERED = 3 * DAY;
 const $ = id => document.getElementById(id);
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -256,19 +261,34 @@ const store = {
 
 let results = [], tab = 'triggered', running = false, stopped = false, ctrl = null, wake = null;
 let seen = new Set(store.get('rs_seen', [])), seenAtStart = new Set(seen), actx = null;
-let scanned = { done: 0, total: 0, failed: 0, t0: 0 };
+let watch = store.get('rs_watch', []);              // setups still waiting for a break
+let recentTrig = store.get('rs_trig', []);          // triggered setups kept for 3 days
+let dismissed = new Set(store.get('rs_dismissed', []));
+let scanned = { done: 0, total: 0, failed: 0, t0: 0, rej: 0 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const wkey = s => s.symbol + '|' + s.S + '|' + s.dayT;
+const keyOf = s => wkey(s) + '|' + s.touchT + '|' + s.status;
 
-async function api(path, signal) {
-  for (let n = 0; n < 5; n++) {
-    let r;
-    try { r = await fetch(API + path, { signal }); }
-    catch (e) { if (signal.aborted || n === 4) throw e; await sleep(500 * (n + 1)); continue; }
-    if (r.status === 429) { await sleep(1200 * (n + 1)); continue; }
+// One request with its own timeout, so a stalled connection can never hang a scan.
+async function getJSON(path, signal) {
+  const c = new AbortController();
+  const onAbort = () => c.abort();
+  signal.addEventListener('abort', onAbort);
+  const timer = setTimeout(() => c.abort(), TIMEOUT);
+  try {
+    const r = await fetch(API + path, { signal: c.signal });
+    if (r.status === 429) return { rate: true };
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const j = await r.json();
-    if (j.retCode === 10006) { await sleep(1200 * (n + 1)); continue; }
+    return await r.json();
+  } finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); }
+}
+async function api(path, signal) {
+  for (let n = 0; n < 4; n++) {
+    let j;
+    try { j = await getJSON(path, signal); }
+    catch (e) { if (signal.aborted || n === 3) throw e; await sleep(600 * (n + 1)); continue; }
+    if (j.rate || j.retCode === 10006) { await sleep(1200 * (n + 1)); continue; }
     if (j.retCode !== 0) throw new Error(j.retMsg || 'Bybit error');
     return j;
   }
@@ -293,7 +313,6 @@ const hm = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2
 const dfmt = t => new Date(t).toLocaleDateString([], { day: 'numeric', month: 'short', timeZone: 'UTC' });
 
 // ---------- Rendering ----------
-const keyOf = s => s.symbol + '|' + s.S + '|' + s.touchT + '|' + s.status;
 let queued = false;
 function scheduleRender() { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; render(); }); }
 
@@ -308,6 +327,7 @@ function card(s) {
     ? '<span class="chip watch">Swept first low, watching new resistance</span>'
     : '<span class="chip watch">Rejection, resistance not broken</span>';
   else chip = '<span class="chip idle">Rejection, no valid resistance</span>';
+  const rm = s.status === 'watching' ? `<button class="rm" type="button" data-key="${wkey(s)}">Remove</button>` : '';
 
   const rows = [];
   rows.push(`<div><dt>Support</dt><dd>${fp(s.S)}<small>from ${dfmt(s.supportT)}</small></dd></div>`);
@@ -326,7 +346,7 @@ function card(s) {
       ${isNew ? '<span class="new">NEW</span>' : ''}
       <span class="px">${fp(s.price)}</span>
     </div>
-    <div class="chips">${chip}</div>
+    <div class="chips">${chip}${rm}</div>
     <dl class="grid">${rows.join('')}</dl>
   </article>`;
 }
@@ -344,11 +364,16 @@ function render() {
   const items = by[tab];
   if (items.length) $('list').innerHTML = items.map(card).join('');
   else {
-    const waiting = running ? 'Nothing here yet. Still scanning.' :
-      (scanned.total ? 'Nothing here this scan.' : 'Press Scan to check the last closed Daily candle.');
-    $('list').innerHTML = `<div class="empty">${waiting}</div>`;
+    let msg;
+    if (running) msg = 'Nothing here yet. Still scanning.';
+    else if (scanned.total) msg = `Nothing here. ${scanned.rej} rejection${scanned.rej === 1 ? '' : 's'} on the last Daily candle across ${scanned.total} pairs.`;
+    else msg = 'Press Scan to check the last closed Daily candle.';
+    $('list').innerHTML = `<div class="empty">${msg}</div>`;
   }
-  $('seenline').textContent = seen.size ? seen.size + ' alerts seen on this phone' : '';
+  const bits = [];
+  if (watch.length) bits.push(watch.length + ' saved to watch');
+  if (seen.size) bits.push(seen.size + ' alerts seen');
+  $('seenline').textContent = bits.join(' · ');
 }
 
 function setStatus(text, meta) {
@@ -380,13 +405,20 @@ function alertNew() {
 
 // ---------- Scan ----------
 async function scan() {
-  running = true; stopped = false; results = []; showErr('');
+  running = true; stopped = false; showErr('');
   ctrl = new AbortController();
   seenAtStart = new Set(seen);
-  scanned = { done: 0, total: 0, failed: 0, t0: Date.now() };
+  scanned = { done: 0, total: 0, failed: 0, t0: Date.now(), rej: 0 };
+  let now = Date.now();
   $('go').textContent = 'Stop'; $('go').className = 'stop';
   arm();
-  try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+  // Not awaited: a stalled screen-lock request must never block the scan.
+  try {
+    if (navigator.wakeLock) navigator.wakeLock.request('screen')
+      .then(w => { wake = w; if (!running) { try { w.release(); } catch (e) {} } }).catch(() => {});
+  } catch (e) {}
+
+  results = recentTrig.filter(s => now - s.breakT < KEEP_TRIGGERED);
   setStatus('Loading pairs', ''); render();
 
   try {
@@ -395,16 +427,31 @@ async function scan() {
     store.set('rs_cfg', { maxPrice, minVol, sound: $('sound').checked });
 
     const tk = await api('/v5/market/tickers?category=spot', ctrl.signal);
-    const now = +tk.time || Date.now();
+    now = +tk.time || Date.now();
     const dayT = Math.floor(now / DAY) * DAY - DAY;
     $('dayline').textContent = `Daily candle of ${dfmt(dayT)} (UTC), closed at ${hm(dayT + DAY)} your time.`;
 
+    const prices = {};
+    tk.result.list.forEach(x => { prices[x.symbol] = parseFloat(x.lastPrice); });
     const list = tk.result.list
       .filter(x => x.symbol.endsWith('USDT'))
       .map(x => ({ symbol: x.symbol, price: parseFloat(x.lastPrice), vol: parseFloat(x.turnover24h) || 0 }))
       .filter(x => x.price > 0 && x.price < maxPrice && x.vol >= minVol);
-    scanned.total = list.length;
-    setStatus('Scanning', `0 / ${list.length}`);
+    // Saved setups from earlier days that are still listed. Today's rejections are handled by the main pass.
+    const saved = watch.filter(w => w.dayT !== dayT && prices[w.symbol] > 0 && !dismissed.has(wkey(w)));
+    scanned.total = list.length + saved.length;
+    setStatus('Scanning', `0 / ${scanned.total}`);
+
+    const addResult = s => {
+      const k = wkey(s);
+      results = results.filter(x => !(wkey(x) === k && x.touchT === s.touchT));
+      results.push(s);
+      const sk = keyOf(s);
+      if (s.status !== 'none' && !seenAtStart.has(sk)) {
+        if (s.status === 'triggered') alertNew();
+        seen.add(sk);
+      }
+    };
 
     let idx = 0;
     const worker = async () => {
@@ -414,6 +461,7 @@ async function scan() {
           const dj = await api(`/v5/market/kline?category=spot&symbol=${p.symbol}&interval=D&limit=${LB.daily}`, ctrl.signal);
           const daily = parseK(dj.result.list, DAY, now);
           const rejs = findRejections(daily);
+          scanned.rej += rejs.length;
           if (rejs.length && !stopped) {
             const hj = await api(`/v5/market/kline?category=spot&symbol=${p.symbol}&interval=240&limit=${LB.h4}`, ctrl.signal);
             const h4 = parseK(hj.result.list, H4MS, now);
@@ -421,18 +469,13 @@ async function scan() {
               const s = evaluate(r, h4);
               if (!s) return;
               s.symbol = p.symbol; s.price = p.price; s.vol = p.vol;
-              results.push(s);
-              const k = keyOf(s);
-              if (s.status !== 'none' && !seenAtStart.has(k)) {
-                if (s.status === 'triggered') alertNew();
-                seen.add(k);
-              }
+              if (dismissed.has(wkey(s))) return;
+              addResult(s);
             });
-            store.set('rs_seen', Array.from(seen));
             scheduleRender();
           }
         } catch (e) {
-          if (stopped || (ctrl && ctrl.signal.aborted)) return;
+          if (stopped || ctrl.signal.aborted) return;
           scanned.failed++;
         }
         scanned.done++;
@@ -441,15 +484,47 @@ async function scan() {
     };
     await Promise.all(Array.from({ length: CONC }, worker));
 
+    // Recheck saved setups against the latest H4 candles.
+    let j2 = 0;
+    const recheck = async () => {
+      while (!stopped && j2 < saved.length) {
+        const w = saved[j2++];
+        try {
+          const hj = await api(`/v5/market/kline?category=spot&symbol=${w.symbol}&interval=240&limit=${LB.h4}`, ctrl.signal);
+          const h4 = parseK(hj.result.list, H4MS, now);
+          const s = evaluate({ S: w.S, supportT: w.supportT, dayT: w.dayT }, h4);
+          if (s) { s.symbol = w.symbol; s.price = prices[w.symbol]; s.vol = w.vol; addResult(s); scheduleRender(); }
+        } catch (e) {
+          if (stopped || ctrl.signal.aborted) return;
+          scanned.failed++;
+        }
+        scanned.done++;
+        setStatus('Rechecking saved', `${scanned.done} / ${scanned.total}`);
+      }
+    };
+    await Promise.all(Array.from({ length: CONC }, recheck));
+
+    // Update the watch list: still-waiting setups stay, triggered ones move to recent triggers.
+    const kept = new Map();
+    watch.forEach(w => kept.set(wkey(w), w));
+    results.forEach(s => {
+      if (s.status === 'watching') kept.set(wkey(s), s);
+      else if (s.status === 'triggered') kept.delete(wkey(s));
+    });
+    watch = Array.from(kept.values());
+    recentTrig = results.filter(s => s.status === 'triggered' && now - s.breakT < KEEP_TRIGGERED);
+    store.set('rs_watch', watch); store.set('rs_trig', recentTrig); store.set('rs_seen', Array.from(seen));
+
     const secs = Math.round((Date.now() - scanned.t0) / 1000);
     const f = scanned.failed ? ` · ${scanned.failed} failed` : '';
-    if (stopped) setStatus('Stopped', `${scanned.done} / ${scanned.total}${f}`);
-    else setStatus('Done', `${scanned.total} pairs · ${secs}s${f}`);
+    const body = `${scanned.done} / ${scanned.total} pairs · ${scanned.rej} rejections${f}`;
+    if (stopped) setStatus('Stopped', body);
+    else setStatus('Done', `${body} · ${secs}s`);
   } catch (e) {
     if (stopped) setStatus('Stopped', `${scanned.done} / ${scanned.total}`);
     else {
       setStatus('Scan failed', '');
-      showErr('Could not reach Bybit. Check your connection and try again. If it keeps failing, Bybit may be blocking this network or region.');
+      showErr(`Could not reach Bybit (${e && e.message ? e.message : 'no reply'}). Check your connection and try again. If it keeps failing, Bybit may be blocking this network or region.`);
     }
   } finally {
     running = false;
@@ -464,9 +539,19 @@ function stop() { stopped = true; try { ctrl.abort(); } catch (e) {} }
 $('go').addEventListener('click', () => { running ? stop() : scan(); });
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => { tab = b.dataset.tab; render(); }));
 $('clearSeen').addEventListener('click', () => { seen = new Set(); seenAtStart = new Set(); store.set('rs_seen', []); render(); });
+$('list').addEventListener('click', e => {
+  const b = e.target.closest ? e.target.closest('.rm') : null;
+  if (!b) return;
+  const k = b.dataset.key;
+  dismissed.add(k); store.set('rs_dismissed', Array.from(dismissed));
+  watch = watch.filter(w => wkey(w) !== k); store.set('rs_watch', watch);
+  results = results.filter(s => !(s.status === 'watching' && wkey(s) === k));
+  render();
+});
 
 const cfg = store.get('rs_cfg', null);
 if (cfg) { $('maxPrice').value = cfg.maxPrice; $('minVol').value = cfg.minVol; $('sound').checked = cfg.sound !== false; }
+results = recentTrig.filter(s => Date.now() - s.breakT < KEEP_TRIGGERED);
 render();
 </script>
 </body>
