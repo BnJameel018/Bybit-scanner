@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<title>Bybit Support → Resistance Scanner</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#f3f4f6}
+*{box-sizing:border-box}body{margin:0}.wrap{max-width:900px;margin:auto;padding:18px}
+.card{background:white;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 2px 10px #00000010}
+h1{font-size:22px;margin:0 0 8px}.muted{color:#6b7280;font-size:13px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.btn{border:0;border-radius:10px;padding:12px 16px;font-weight:700;font-size:15px}
+.primary{background:#111827;color:white}.danger{background:#dc2626;color:white}.secondary{background:#e5e7eb;color:#111827}
+input{padding:11px;border:1px solid #d1d5db;border-radius:9px;width:100px}
+.progress{height:9px;background:#e5e7eb;border-radius:99px;overflow:hidden}.bar{height:100%;width:0;background:#111827;transition:.2s}
+.stat{display:inline-block;margin:5px 5px 0 0;padding:7px 10px;background:#f3f4f6;border-radius:9px;font-size:13px}
+.result{border:1px solid #e5e7eb;border-radius:12px;padding:13px;margin-top:9px}
+.result a{color:#2563eb;text-decoration:none;font-weight:700}
+.good{color:#047857;font-weight:700}.warn{color:#b45309;font-weight:700}.bad{color:#b91c1c}
+pre{white-space:pre-wrap;font-size:12px;max-height:180px;overflow:auto;background:#111827;color:#e5e7eb;padding:10px;border-radius:9px}
+.small{font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Bybit Support → Resistance Scanner</h1>
+    <div class="muted">Spot USDT pairs • current price &lt; $50 • Daily + H4 rules</div>
+    <div class="row" style="margin-top:12px">
+      <button id="scan" class="btn primary">Scan</button>
+      <button id="stop" class="btn danger" disabled>Stop</button>
+      <button id="clear" class="btn secondary">Clear</button>
+    </div>
+    <div style="margin-top:12px" class="progress"><div id="bar" class="bar"></div></div>
+    <div id="status" class="muted" style="margin-top:8px">Ready.</div>
+    <div id="stats"></div>
+  </div>
+
+  <div class="card">
+    <b>Monitoring</b>
+    <div class="muted" style="margin-top:5px">This browser session can monitor H4 closes for pairs discovered by the scan. It is not a 24/7 background service when iOS suspends the page.</div>
+    <div id="monitor"></div>
+  </div>
+
+  <div class="card">
+    <b>Matches</b>
+    <div id="results"><div class="muted" style="margin-top:8px">No results yet.</div></div>
+  </div>
+
+  <div class="card">
+    <details><summary>Diagnostics</summary><pre id="log"></pre></details>
+  </div>
+</div>
+
+<script>
+const API="https://api.bybit.com";
+const state={
+  stop:false, symbols:[], results:[], monitored:new Map(), completed:new Set(),
+  requests:0, errors:0
+};
+const $=id=>document.getElementById(id);
+function log(x){$("log").textContent += `[${new Date().toLocaleTimeString()}] ${x}\n`; $("log").scrollTop=$("log").scrollHeight;}
+function setStatus(x){$("status").textContent=x}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function candle(a){return {start:+a[0],open:+a[1],high:+a[2],low:+a[3],close:+a[4],volume:+a[5],turnover:+a[6]}}
+function bull(c){return c.close>c.open}
+function bear(c){return c.close<c.open}
+function fmt(x){if(!Number.isFinite(x))return "-"; return x>=1?x.toFixed(6).replace(/0+$/,"").replace(/\.$/,""):x.toPrecision(6)}
+function bybitUrl(s){return `https://www.bybit.com/trade/spot/${s}`}
+async function api(path, params, signal){
+  const u=new URL(API+path); Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v));
+  const r=await fetch(u,{signal}); state.requests++;
+  if(!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j=await r.json();
+  if(j.retCode!==0) throw new Error(j.retMsg||"Bybit API error");
+  return j.result;
+}
+async function getKlines(symbol,interval,limit,signal){
+  const r=await api("/v5/market/kline",{category:"spot",symbol,interval,limit},signal);
+  return r.list.map(candle).sort((a,b)=>a.start-b.start);
+}
+async function getSymbols(signal){
+  const [inst,tick]=await Promise.all([
+    api("/v5/market/instruments-info",{category:"spot"},signal),
+    api("/v5/market/tickers",{category:"spot"},signal)
+  ]);
+  const prices=new Map(tick.list.map(x=>[x.symbol,+x.lastPrice]));
+  return inst.list.filter(x=>
+    x.status==="Trading" &&
+    x.quoteCoin==="USDT" &&
+    prices.has(x.symbol) &&
+    prices.get(x.symbol)>0 &&
+    prices.get(x.symbol)<50
+  ).map(x=>({symbol:x.symbol,price:prices.get(x.symbol)}));
+}
+
+/*
+  Daily support engine:
+  - every bearish->bullish consecutive pair creates a support at bearish close.
+  - a support is untouched until a later Daily candle has low <= support.
+  - first touch is a rejection only if that candle closes > support.
+  - otherwise support is permanently invalidated.
+  This scan is deliberately historical and keeps all untouched supports.
+*/
+function findSupportsAndRejections(days){
+  const supports=[];
+  for(let i=1;i<days.length;i++){
+    const a=days[i-1], b=days[i];
+    if(!bear(a)||!bull(b)) continue;
+    supports.push({
+      id:`${a.start}-${a.close}`,
+      level:a.close, created:a.start, patternEnd:b.start,
+      touched:false, invalid:false, rejection:null, touchIndex:null
+    });
+  }
+  for(const s of supports){
+    for(let i=0;i<days.length;i++){
+      const d=days[i];
+      if(d.start<=s.patternEnd) continue;
+      if(d.low<=s.level){
+        s.touched=true;s.touchIndex=i;
+        if(d.close>s.level){
+          s.rejection={day:d, support:s.level};
+        }else s.invalid=true;
+        break;
+      }
+    }
+  }
+  return supports.filter(s=>s.rejection && !s.invalid);
+}
+
+/*
+  H4 resistance:
+  bullish candle immediately followed by bearish candle; resistance is bullish close.
+  A resistance is "pre-existing" for a rejection if its bearish confirmation candle
+  closed before the rejection day's first touch.
+*/
+function resistancesBefore(h4, cutoff){
+  const rs=[];
+  for(let i=1;i<h4.length;i++){
+    const a=h4[i-1],b=h4[i];
+    if(a.start>=cutoff) break;
+    if(bull(a)&&bear(b)){
+      rs.push({level:a.close,formedAt:b.start,source:a});
+    }
+  }
+  return rs.filter(r=>r.formedAt<cutoff);
+}
+function lowestPreexistingResistance(h4,support,rejectionDayStart){
+  const rs=resistancesBefore(h4,rejectionDayStart)
+    .filter(r=>r.level>support)
+    .sort((a,b)=>a.level-b.level);
+  return rs[0]||null;
+}
+function h4BreakBetween(h4,res,start,end){
+  if(!res)return null;
+  return h4.find(c=>c.start>=start && c.start<end && c.close>res.level)||null;
+}
+
+/*
+  Special post-first-touch path:
+  If there is no suitable pre-existing resistance, permit a resistance created
+  after the first support touch ONLY when a later touch strictly sweeps the
+  first-touch low. A subsequent touch that strictly sweeps the second-touch low
+  invalidates this special setup.
+*/
+function specialSetup(h4, support, firstTouchDay, dayEnd){
+  const t0=firstTouchDay.start;
+  const firstLow=firstTouchDay.low;
+  let firstResistance=null;
+  for(let i=1;i<h4.length;i++){
+    const a=h4[i-1],b=h4[i];
+    if(b.start<=t0 || b.start>=dayEnd) continue;
+    if(bull(a)&&bear(b)&&a.close>support){
+      firstResistance={level:a.close,formedAt:b.start,source:a};
+      break;
+    }
+  }
+  if(!firstResistance)return null;
+
+  // Treat Daily touch events from Daily candles after first touch as the sweep events.
+  // A qualifying second touch must have low < firstLow and close > support.
+  const sweepCandidates=h4.filter(c=>c.start>=t0 && c.start<dayEnd && c.low<=support);
+  if(!sweepCandidates.length)return null;
+
+  let secondLow=null, secondTime=null;
+  for(const c of sweepCandidates){
+    if(c.low<firstLow){secondLow=c.low;secondTime=c.start;break}
+  }
+  if(secondLow===null)return null;
+
+  const broken=h4.find(c=>c.start>secondTime && c.close>firstResistance.level);
+  if(broken)return {resistance:firstResistance,firstLow,secondLow,secondTime,broken,special:true};
+
+  const third=h4.find(c=>c.start>secondTime && c.low<secondLow && c.low<=support);
+  if(third)return {invalid:true,special:true};
+
+  return {resistance:firstResistance,firstLow,secondLow,secondTime,broken:null,special:true};
+}
+
+function renderResults(){
+  const box=$("results"); box.innerHTML="";
+  if(!state.results.length){box.innerHTML='<div class="muted">No confirmed setups found.</div>';return}
+  for(const r of state.results){
+    const d=document.createElement("div");d.className="result";
+    d.innerHTML=`<div><a target="_blank" rel="noopener" href="${bybitUrl(r.symbol)}">${r.symbol}</a> <span class="muted">price ${fmt(r.price)}</span></div>
+      <div class="small" style="margin-top:6px">
+      Support: <b>${fmt(r.support)}</b> • Rejection: <span class="good">YES</span> •
+      Resistance: <b>${fmt(r.resistance)}</b> • H4 break: <span class="good">YES</span>
+      ${r.special?' • Special sweep path':''}</div>`;
+    box.appendChild(d);
+  }
+}
+function renderMonitor(){
+  const box=$("monitor");box.innerHTML="";
+  if(!state.monitored.size){box.innerHTML='<div class="muted" style="margin-top:8px">No active monitoring setups.</div>';return}
+  for(const [s,m] of state.monitored){
+    const d=document.createElement("div");d.className="result";
+    d.innerHTML=`<b>${s}</b> <span class="muted">${fmt(m.price)}</span>
+      <div class="small">Support ${fmt(m.support)} → Resistance ${fmt(m.resistance)} • monitoring since ${new Date(m.since).toLocaleString()}</div>`;
+    box.appendChild(d);
+  }
+}
+function updateStats(done,total){
+  $("bar").style.width=(total?Math.round(done/total*100):0)+"%";
+  $("stats").innerHTML=`<span class="stat">Pairs: ${total}</span><span class="stat">Processed: ${done}</span><span class="stat">Matches: ${state.results.length}</span><span class="stat">Monitoring: ${state.monitored.size}</span>`;
+}
+
+async function analyzeSymbol(item,signal){
+  const [days,h4]=await Promise.all([
+    getKlines(item.symbol,"D",500,signal),
+    getKlines(item.symbol,"240",1000,signal)
+  ]);
+  // Last Daily kline can be open. Exclude it.
+  const now=Date.now();
+  const closedDays=days.filter(c=>c.start+86400000<=now);
+  if(closedDays.length<3)return null;
+
+  const supports=findSupportsAndRejections(closedDays);
+  if(!supports.length)return null;
+
+  // Evaluate each valid rejection, newest first. First qualifying setup is returned.
+  const candidates=supports.sort((a,b)=>b.rejection.day.start-a.rejection.day.start);
+  for(const s of candidates){
+    const rejDay=s.rejection.day;
+    const rejectionDayEnd=rejDay.start+86400000;
+    const res=lowestPreexistingResistance(h4,s.level,rejDay.start);
+    let br=res?h4BreakBetween(h4,res,rejDay.start,rejectionDayEnd):null;
+
+    if(br){
+      return {symbol:item.symbol,price:item.price,support:s.level,resistance:res.level,breakCandle:br};
+    }
+
+    // Special path is evaluated only if no pre-existing resistance exists.
+    if(!res){
+      const sp=specialSetup(h4,s.level,rejDay,rejectionDayEnd);
+      if(sp?.broken){
+        return {symbol:item.symbol,price:item.price,support:s.level,resistance:sp.resistance.level,breakCandle:sp.broken,special:true};
+      }
+    }
+
+    if(res){
+      state.monitored.set(item.symbol,{symbol:item.symbol,price:item.price,support:s.level,resistance:res.level,since:Date.now(),special:false});
+      return null;
+    }
+  }
+  return null;
+}
+
+async function scan(){
+  state.stop=false; state.results=[]; state.monitored.clear();
+  $("scan").disabled=true;$("stop").disabled=false;$("clear").disabled=true;$("log").textContent="";
+  const ac=new AbortController(); window.scanController=ac;
+  try{
+    setStatus("Loading Bybit Spot USDT pairs under $50...");
+    state.symbols=await getSymbols(ac.signal);
+    log(`Eligible symbols: ${state.symbols.length}`);
+    let done=0;
+    updateStats(done,state.symbols.length);
+    // Conservative concurrency to reduce browser/API pressure.
+    const queue=[...state.symbols];
+    const workers=Array.from({length:6},async()=>{
+      while(queue.length&&!state.stop){
+        const item=queue.shift();
+        try{
+          setStatus(`Scanning ${item.symbol} (${done+1}/${state.symbols.length})`);
+          const r=await analyzeSymbol(item,ac.signal);
+          if(r){
+            state.results.push(r);
+            renderResults();
+            log(`MATCH ${item.symbol}`);
+          }
+        }catch(e){
+          if(e.name!=="AbortError"){state.errors++;log(`${item.symbol}: ${e.message}`)}
+        }
+        done++;updateStats(done,state.symbols.length);
+      }
+    });
+    await Promise.all(workers);
+    renderMonitor();
+    if(state.stop)setStatus("Scan stopped.");
+    else setStatus(`Scan complete. ${state.results.length} confirmed setup(s); ${state.monitored.size} monitoring.`);
+  }catch(e){
+    if(e.name==="AbortError")setStatus("Scan stopped.");
+    else {setStatus("Scan failed: "+e.message);log(e.stack||e.message)}
+  }finally{
+    $("scan").disabled=false;$("stop").disabled=true;$("clear").disabled=false;
+  }
+}
+$("scan").onclick=scan;
+$("stop").onclick=()=>{state.stop=true;window.scanController?.abort();setStatus("Stopping…")};
+$("clear").onclick=()=>{state.results=[];state.monitored.clear();renderResults();renderMonitor();$("bar").style.width="0%";$("stats").innerHTML="";$("status").textContent="Ready.";};
+renderResults();renderMonitor();
+</script>
+</body>
+</html>
