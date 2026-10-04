@@ -250,7 +250,8 @@ function analyze(daily, h4) {
 // ==== LOGIC END
 
 // ---------- App ----------
-const API = 'https://api.bybit.com';
+const HOSTS = ['https://api.bytick.com', 'https://api.bybit.com'];
+let hostIdx = 0;
 const LB = { daily: 365, h4: 400 };
 const CONC = 6, TIMEOUT = 15000, KEEP_TRIGGERED = 3 * DAY;
 const $ = id => document.getElementById(id);
@@ -271,23 +272,28 @@ const wkey = s => s.symbol + '|' + s.S + '|' + s.dayT;
 const keyOf = s => wkey(s) + '|' + s.touchT + '|' + s.status;
 
 // One request with its own timeout, so a stalled connection can never hang a scan.
-async function getJSON(path, signal) {
+async function getJSON(host, path, signal) {
   const c = new AbortController();
   const onAbort = () => c.abort();
   signal.addEventListener('abort', onAbort);
   const timer = setTimeout(() => c.abort(), TIMEOUT);
   try {
-    const r = await fetch(API + path, { signal: c.signal });
+    const r = await fetch(host + path, { signal: c.signal });
     if (r.status === 429) return { rate: true };
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.json();
   } finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); }
 }
 async function api(path, signal) {
-  for (let n = 0; n < 4; n++) {
+  for (let n = 0; n < 5; n++) {
+    const used = hostIdx;
     let j;
-    try { j = await getJSON(path, signal); }
-    catch (e) { if (signal.aborted || n === 3) throw e; await sleep(600 * (n + 1)); continue; }
+    try { j = await getJSON(HOSTS[used], path, signal); }
+    catch (e) {
+      if (signal.aborted || n === 4) throw e;
+      if (hostIdx === used) hostIdx = (used + 1) % HOSTS.length;   // switch to the other Bybit address
+      await sleep(400 * (n + 1)); continue;
+    }
     if (j.rate || j.retCode === 10006) { await sleep(1200 * (n + 1)); continue; }
     if (j.retCode !== 0) throw new Error(j.retMsg || 'Bybit error');
     return j;
@@ -524,7 +530,7 @@ async function scan() {
     if (stopped) setStatus('Stopped', `${scanned.done} / ${scanned.total}`);
     else {
       setStatus('Scan failed', '');
-      showErr(`Could not reach Bybit (${e && e.message ? e.message : 'no reply'}). Check your connection and try again. If it keeps failing, Bybit may be blocking this network or region.`);
+      showErr(`Could not reach Bybit (${e && e.message ? e.message : 'no reply'}). Both Bybit addresses failed. Check your connection, or try another network or a VPN.`);
     }
   } finally {
     running = false;
