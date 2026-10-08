@@ -77,9 +77,12 @@ svg.i .f{fill:currentColor;stroke:none}
 .wd{width:34px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--bg);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}
 .wd i{display:block;width:20px;background:var(--ink);border-radius:2px}
 .wd[aria-pressed=true]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
-.mini{height:30px;min-width:30px;padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:600 12.5px var(--sans);cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
+.mini{white-space:nowrap;height:30px;min-width:30px;padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:600 12.5px var(--sans);cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
 .mini.danger{color:var(--warn)}
 
+.sigbar{top:auto;bottom:34px;left:8px;transform:none;max-width:calc(100% - 70px);flex-wrap:wrap;font:600 12.5px var(--sans)}
+.sigbar b{font-weight:700}
+.sigbar span{color:var(--mute);font-weight:500}
 .toast{position:absolute;left:50%;transform:translateX(-50%);bottom:42px;padding:8px 14px;border-radius:10px;background:var(--ink);color:var(--panel);font:600 13px var(--sans);max-width:calc(100% - 24px);text-align:center;z-index:4;pointer-events:none}
 .toast[hidden]{display:none}
 .loading{position:absolute;right:76px;top:8px;padding:2px 9px;border-radius:99px;background:var(--bg);color:var(--mute);font:600 11px var(--sans);z-index:2}
@@ -90,6 +93,7 @@ svg.i .f{fill:currentColor;stroke:none}
 .rbar{background:var(--panel);border-top:1px solid var(--line);padding:6px 10px;display:flex;flex-direction:column;gap:6px}
 .rbar[hidden]{display:none}
 .rrow{display:flex;gap:6px;align-items:center;justify-content:space-between}
+.rinfo span{white-space:nowrap}
 .rinfo{display:flex;align-items:center;gap:8px;font:600 12px var(--mono);color:var(--mute);min-width:0}
 .chip{padding:2px 9px;border-radius:99px;background:var(--accent);color:var(--on-accent);font:700 11px var(--sans);white-space:nowrap}
 select.btn{padding:0 8px;appearance:none;-webkit-appearance:none;text-align:center}
@@ -134,6 +138,7 @@ input[type=search],input[type=datetime-local]{width:100%;height:44px;border:1px 
         <button class="mini" id="bDate" type="button">Pick date</button>
         <button class="mini" id="bCancel" type="button">Cancel</button>
       </div>
+      <div class="float sigbar" id="sigbar" hidden></div>
       <button class="autobtn" id="autoBtn" type="button" hidden>Auto</button>
       <div class="toast" id="toast" hidden></div>
     </main>
@@ -141,7 +146,7 @@ input[type=search],input[type=datetime-local]{width:100%;height:44px;border:1px 
   <footer class="rbar" id="rbar" hidden>
     <div class="rrow">
       <div class="rinfo"><span class="chip" id="rChip">Replay</span><span id="rTime"></span></div>
-      <button class="mini" id="rNew" type="button">Replay again</button>
+      <div class="row"><button class="mini" id="rNew" type="button">Replay again</button><button class="mini danger" id="rEnd" type="button">Go live</button></div>
     </div>
     <div class="rrow">
       <button class="btn" id="rExit" type="button">Exit</button>
@@ -221,6 +226,8 @@ let undoStack = [], redoStack = [];
 const replay = { active: false, levels: [], endT: 0, selecting: false, playing: false, timer: null, speed: 2, pickMode: 'tap' };
 let cross = null;
 let C = {};
+let marks = [], marksOn = true, marksSym = '', sigInfo = null;
+const MCOL = { sup: '#2ea043', res: '#e5534b', sh: '#d29922', ev: '#2f81f7', crt: '#a371f7' };
 
 // ---------- Canvas ----------
 const cv = $('cv'), ctx = cv.getContext('2d');
@@ -271,6 +278,13 @@ function computePV() {
   let lo = Infinity, hi = -Infinity;
   for (let i = i0; i <= i1; i++) { const b = bars[i]; if (b.low < lo) lo = b.low; if (b.high > hi) hi = b.high; }
   if (!isFinite(lo)) return;
+  if (marksOn && marks.length && hi > lo) {
+    const r0 = hi - lo, a = lo, b = hi;
+    for (const m of marks) {
+      if (!segOn(m)) continue;
+      if (m.p >= a - r0 * 1.5 && m.p <= b + r0 * 1.5) { if (m.p < lo) lo = m.p; if (m.p > hi) hi = m.p; }
+    }
+  }
   if (hi <= lo) { const d = Math.abs(hi) * 0.01 || 1; hi += d; lo -= d; }
   const r = hi - lo;
   pv = { min: lo - r * 0.2, max: hi + r * 0.08 };
@@ -395,6 +409,7 @@ function draw() {
   // drawings
   for (const d of drawings) renderDrawing(d, d.id === sel);
   if (draft) renderDrawing(draft, true, true);
+  renderMarks();
   // crosshair lines
   let cx = null, cidx = -1;
   if (cross && cross.x <= paneW && cross.y <= paneH) {
@@ -421,6 +436,7 @@ function draw() {
   }
   // price tags of horizontal drawings
   for (const d of drawings) if (d.type === 'hline' || d.type === 'hray') { const y = p2y(d.pts[0].p); if (y >= 0 && y <= paneH) tag(fmtP(d.pts[0].p), y, d.color, '#ffffff'); }
+  for (const m of marks) if (m.k === 'seg' && segOn(m)) { const y = p2y(m.p); if (y >= 0 && y <= paneH) tag(fmtP(m.p), y, MCOL[m.c] || MCOL.ev, '#ffffff'); }
   // crosshair labels
   if (cx !== null) {
     tag(fmtP(y2p(cross.y)), cross.y, C.cross, C.bg);
@@ -438,6 +454,56 @@ function tag(text, y, bg, fg) {
   ctx.font = FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   ctx.fillStyle = bg; ctx.fillRect(paneW + 1, y - 9, axisW - 1, 18);
   ctx.fillStyle = fg; ctx.fillText(text, paneW + 6, y + 0.5);
+}
+
+// ---------- Signal marks (levels sent from the scanner) ----------
+const segOn = m => marksOn && m.tfs.includes(tf.iv) && !(replay.active && m.t1 >= replay.endT);
+const segOpen = m => !m.t2 || (replay.active && m.t2 >= replay.endT);
+const snapX = t => l2x(Math.floor(timeToLogical(t) + 1e-6));
+function renderMarks() {
+  if (!marks.length || !n) return;
+  ctx.save(); ctx.font = '600 11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace'; ctx.textBaseline = 'alphabetic'; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (const m of marks) {
+    if (!segOn(m)) continue;
+    const y = p2y(m.p), col = MCOL[m.c] || MCOL.ev, open = segOpen(m);
+    if (y < -20 || y > paneH + 20) continue;
+    const x1 = snapX(m.t1), x2 = open ? paneW : snapX(m.t2);
+    if (x2 < 0 || x1 > paneW) continue;
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2; ctx.setLineDash(open ? [7, 4] : []);
+    ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(x1, y, 3.5, 0, Math.PI * 2); ctx.fill();
+    if (!open) { ctx.beginPath(); ctx.arc(x2, y, 5, 0, Math.PI * 2); ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.bg; ctx.stroke(); }
+    ctx.textAlign = 'left'; ctx.lineWidth = 3; ctx.strokeStyle = C.bg;
+    const lx = clamp(x1 + 8, 4, paneW - 60);
+    const ly = y < 56 ? y + 16 : y - 7;
+    ctx.strokeText(m.l, lx, ly); ctx.fillStyle = col; ctx.fillText(m.l, lx, ly);
+  }
+  ctx.restore();
+}
+function cleanMarks(list) {
+  return (Array.isArray(list) ? list : []).filter(m => m && m.k === 'seg' && isFinite(m.t1) && isFinite(m.p) && Array.isArray(m.tfs)).slice(0, 20)
+    .map(m => ({ k: 'seg', c: MCOL[m.c] ? m.c : 'ev', t1: Math.floor(m.t1 / 1000), t2: m.t2 ? Math.floor(m.t2 / 1000) : 0, p: +m.p, l: String(m.l || '').slice(0, 44), tfs: m.tfs.map(String).slice(0, 6) }));
+}
+function updateSigBar() {
+  const el = $('sigbar');
+  if (!marks.length || !sigInfo) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<b>Scanner signal</b><span>${String(sigInfo.title || '').replace(/[<>&]/g, '')}</span><span style="width:100%;font-size:11px">${String(sigInfo.hint || '').replace(/[<>&]/g, '')}</span>`
+    + (sigInfo.start ? '<button class="mini" type="button" data-a="rp">Replay from touch</button>' : '')
+    + `<button class="mini" type="button" data-a="tog">${marksOn ? 'Hide levels' : 'Show levels'}</button><button class="mini" type="button" data-a="clr">Clear</button>`;
+}
+$('sigbar').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.a === 'tog') { marksOn = !marksOn; updateSigBar(); requestDraw(); }
+  else if (b.dataset.a === 'clr') { marks = []; sigInfo = null; updateSigBar(); requestDraw(); try { history.replaceState(null, '', location.pathname); } catch (er) {} }
+  else if (b.dataset.a === 'rp') { if (replay.active) toast('Exit replay first'); else startReplayAtTime(sigInfo.start); }
+});
+async function fitMarks() {
+  if (!marks.length) return;
+  const earliest = Math.min(...marks.map(m => m.t1));
+  for (let i = 0; i < 6 && bars.length && bars[0].time > earliest && !reachedStart; i++) await extendLeft();
+  const l = timeToLogical(earliest), span = (n - 1) - l + 12;
+  view.spacing = clamp(paneW / span, 2, 20); view.right = (n - 1) + 6; manual = null; clampView(); requestDraw();
 }
 
 // ---------- Drawings ----------
@@ -1009,6 +1075,10 @@ async function exitReplay() {
   }
   renderReplayUI(); checkExtend();
 }
+async function endReplay() {
+  stopPlay(); replay.active = false; replay.levels = []; replay.selecting = false;
+  renderReplayUI(); await loadLatest();
+}
 async function startReplayAtTime(ms) {
   const sec = Math.floor(ms / 1000);
   if (replay.active && sec + tf.sec > replay.endT) { toast('Pick a date before the current replay point'); return; }
@@ -1045,6 +1115,7 @@ async function setTF(t) {
 async function setSymbol(s) {
   if (s === symbol && bars.length) return;
   stopPlay(); replay.active = false; replay.levels = []; replay.selecting = false; renderReplayUI();
+  if (s !== marksSym) { marks = []; sigInfo = null; updateSigBar(); }
   symbol = s; store.set('bc_symbol', s);
   const rec = store.get('bc_recent', []).filter(x => x !== s); rec.unshift(s); store.set('bc_recent', rec.slice(0, 8));
   drawings = store.get('bc_d_' + symbol, []); undoStack = []; redoStack = []; sel = null; draft = null; showSelbar(); updateToolState();
@@ -1139,6 +1210,7 @@ $('bCancel').addEventListener('click', () => { replay.selecting = false; renderR
 $('bFirst').addEventListener('click', () => { replay.selecting = false; renderReplayUI(); startReplayFirst(); });
 $('bDate').addEventListener('click', () => { replay.selecting = false; renderReplayUI(); openDate('replay'); });
 $('rExit').addEventListener('click', exitReplay);
+$('rEnd').addEventListener('click', endReplay);
 $('rBack').addEventListener('click', () => { stopPlay(); stepBack(); });
 $('rFwd').addEventListener('click', () => { stopPlay(); stepFwd(); renderReplayUI(); });
 $('rPlay').addEventListener('click', () => { if (replay.playing) { stopPlay(); renderReplayUI(); } else startPlay(); });
@@ -1170,17 +1242,28 @@ function resolveHex() {
 }
 resolveHex();
 if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readColors(); resolveHex(); });
-buildTfs(); buildTools();
+try {
+  const q = new URLSearchParams(location.search).get('sig');
+  if (q) {
+    const sg = JSON.parse(q);
+    if (sg && /^[A-Z0-9]{3,20}$/.test(sg.sym || '')) {
+      symbol = sg.sym; marksSym = sg.sym;
+      const ti = TFS.findIndex(t => t.iv === String(sg.tf)); if (ti >= 0) tf = TFS[ti];
+      marks = cleanMarks(sg.marks); sigInfo = { title: sg.title || '', start: isFinite(sg.start) ? sg.start : 0, hint: String(sg.hint || '').slice(0, 120) };
+    }
+  }
+} catch (e) {}
+buildTfs(); buildTools(); updateSigBar();
 drawings = store.get('bc_d_' + symbol, []);
 applyInstrument(); renderReplayUI(); showSelbar();
 resize(); requestAnimationFrame(frame);
 loadInstruments();
-loadLatest();
+loadLatest().then(fitMarks);
 
 // handles used by automated tests
 window.__bc = {
   get s() { return { symbol, tf: tf.label, n, bars: bars.length, reachedStart, reachedEnd, view: { ...view }, manual, pv: { ...pv }, tool, sel, drawings, draft, replay: { active: replay.active, levels: replay.levels.slice(), endT: replay.endT, selecting: replay.selecting, playing: replay.playing }, paneW, paneH, axisW, W, H, undo: undoStack.length, redo: redoStack.length, magnet, instruments: instruments.length }; },
-  bars: () => bars, setTool, setTF: i => setTF(TFS[i]), setSymbol, x2l, l2x, p2y, y2p, timeToLogical, logicalToTime, toXY, stepFwd, stepBack, exitReplay, startReplayAtTime, startPlay, stopPlay, undo, redo
+  bars: () => bars, marks: () => marks, endReplay, setTool, setTF: i => setTF(TFS[i]), setSymbol, x2l, l2x, p2y, y2p, timeToLogical, logicalToTime, toXY, stepFwd, stepBack, exitReplay, startReplayAtTime, startPlay, stopPlay, undo, redo
 };
 })();
 </script>
